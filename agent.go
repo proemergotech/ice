@@ -57,6 +57,8 @@ type Agent struct {
 	portmin uint16
 	portmax uint16
 
+	extraHostIPs map[NetworkType][]net.IP
+
 	//How long should a pair stay quiet before we declare it dead?
 	//0 means never timeout
 	connectionTimeout time.Duration
@@ -124,6 +126,9 @@ type AgentConfig struct {
 	// support for specific network types.
 	NetworkTypes []NetworkType
 
+	// ExtraHostIPs lets you specify extra ips that should be considered for "host" type candidates
+	ExtraHostIPs map[NetworkType][]net.IP
+
 	LoggerFactory logging.LoggerFactory
 }
 
@@ -144,15 +149,16 @@ func NewAgent(config *AgentConfig) (*Agent, error) {
 		localCandidates:  make(map[NetworkType][]*Candidate),
 		remoteCandidates: make(map[NetworkType][]*Candidate),
 
-		localUfrag:  randSeq(16),
-		localPwd:    randSeq(32),
-		taskChan:    make(chan task),
-		onConnected: make(chan struct{}),
-		buffer:      packetio.NewBuffer(),
-		done:        make(chan struct{}),
-		portmin:     config.PortMin,
-		portmax:     config.PortMax,
-		log:         config.LoggerFactory.NewLogger("ice"),
+		localUfrag:   randSeq(16),
+		localPwd:     randSeq(32),
+		taskChan:     make(chan task),
+		onConnected:  make(chan struct{}),
+		buffer:       packetio.NewBuffer(),
+		done:         make(chan struct{}),
+		portmin:      config.PortMin,
+		portmax:      config.PortMax,
+		extraHostIPs: config.ExtraHostIPs,
+		log:          config.LoggerFactory.NewLogger("ice"),
 	}
 
 	// Make sure the buffer doesn't grow indefinitely.
@@ -229,6 +235,11 @@ func (a *Agent) listenUDP(network string, laddr *net.UDPAddr) (*net.UDPConn, err
 
 func (a *Agent) gatherCandidatesLocal(networkTypes []NetworkType) {
 	localIPs := localInterfaces(networkTypes)
+	if a.extraHostIPs != nil {
+		for _, n := range networkTypes {
+			localIPs = append(localIPs, a.extraHostIPs[n]...)
+		}
+	}
 	for _, ip := range localIPs {
 		for _, network := range supportedNetworks {
 			conn, err := a.listenUDP(network, &net.UDPAddr{IP: ip, Port: 0})
