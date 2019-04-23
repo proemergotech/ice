@@ -57,7 +57,7 @@ type Agent struct {
 	portmin uint16
 	portmax uint16
 
-	extraHostIPs map[NetworkType][]net.IP
+	localNatRule NatRule
 
 	//How long should a pair stay quiet before we declare it dead?
 	//0 means never timeout
@@ -86,6 +86,8 @@ type Agent struct {
 
 	log logging.LeveledLogger
 }
+
+type NatRule func(network string, localIP net.IP, localPort int) (natIP net.IP, natPort int)
 
 func (a *Agent) ok() error {
 	select {
@@ -126,8 +128,8 @@ type AgentConfig struct {
 	// support for specific network types.
 	NetworkTypes []NetworkType
 
-	// ExtraHostIPs lets you specify extra ips that should be considered for "host" type candidates
-	ExtraHostIPs map[NetworkType][]net.IP
+	// LocalNatRule lets you specify extra ips that should be considered for "host" type candidates
+	LocalNatRule NatRule
 
 	LoggerFactory logging.LoggerFactory
 }
@@ -157,7 +159,7 @@ func NewAgent(config *AgentConfig) (*Agent, error) {
 		done:         make(chan struct{}),
 		portmin:      config.PortMin,
 		portmax:      config.PortMax,
-		extraHostIPs: config.ExtraHostIPs,
+		localNatRule: config.LocalNatRule,
 		log:          config.LoggerFactory.NewLogger("ice"),
 	}
 
@@ -235,11 +237,6 @@ func (a *Agent) listenUDP(network string, laddr *net.UDPAddr) (*net.UDPConn, err
 
 func (a *Agent) gatherCandidatesLocal(networkTypes []NetworkType) {
 	localIPs := localInterfaces(networkTypes)
-	if a.extraHostIPs != nil {
-		for _, n := range networkTypes {
-			localIPs = append(localIPs, a.extraHostIPs[n]...)
-		}
-	}
 	for _, ip := range localIPs {
 		for _, network := range supportedNetworks {
 			conn, err := a.listenUDP(network, &net.UDPAddr{IP: ip, Port: 0})
@@ -258,11 +255,47 @@ func (a *Agent) gatherCandidatesLocal(networkTypes []NetworkType) {
 			networkType := c.NetworkType
 			set := a.localCandidates[networkType]
 			set = append(set, c)
+
+			natC, natConn := a.createLocalNatCandidate(network, ip)
+			if natC != nil {
+				set = append(set, natC)
+			}
+
 			a.localCandidates[networkType] = set
 
 			c.start(a, conn)
+			if natC != nil {
+				natC.start(a, natConn)
+			}
 		}
 	}
+}
+
+func (a *Agent) createLocalNatCandidate(network string, ip net.IP) (*Candidate, net.PacketConn) {
+	if a.localNatRule == nil {
+		return nil, nil
+	}
+
+	conn, err := a.listenUDP(network, &net.UDPAddr{IP: ip, Port: 0})
+	if err != nil {
+		a.log.Warnf("could not listen %s %s\n", network, ip)
+		return nil, nil
+	}
+
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	natIP, natPort := a.localNatRule(network, ip, port)
+
+	if natIP == nil {
+		return nil, nil
+	}
+
+	c, err := NewCandidateServerReflexive(network, natIP, natPort, ComponentRTP, ip.String(), port)
+	if err != nil {
+		a.log.Warnf("Failed to create host candidate: %s %s %d: %v\n", network, natIP, natPort, err)
+		return nil, nil
+	}
+
+	return c, conn
 }
 
 func (a *Agent) gatherCandidatesReflective(urls []*URL, networkTypes []NetworkType) {
