@@ -26,7 +26,7 @@ func testTimeout(t *testing.T, c *Conn, timeout time.Duration) {
 	statechan := make(chan ConnectionState)
 	ticker := time.NewTicker(pollrate)
 
-	for cnt := time.Duration(0); cnt <= timeout+taskLoopInterval; cnt += pollrate {
+	for cnt := time.Duration(0); cnt <= timeout+defaultTaskLoopInterval; cnt += pollrate {
 		<-ticker.C
 		err := c.agent.run(func(agent *Agent) {
 			statechan <- agent.connectionState
@@ -63,7 +63,7 @@ func TestTimeout(t *testing.T) {
 		panic(err)
 	}
 
-	testTimeout(t, ca, 30*time.Second)
+	testTimeout(t, ca, defaultConnectionTimeout)
 
 	ca, cb = pipeWithTimeout(5*time.Second, 3*time.Second)
 	err = cb.Close()

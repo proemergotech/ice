@@ -117,6 +117,39 @@ func NewCandidateRelay(network string, ip net.IP, port int, component uint16, re
 	}, nil
 }
 
+// handleNewPeerReflexiveCandidate creates a ReflexiveCandidate from a remote transport address
+func handleNewPeerReflexiveCandidate(local *Candidate, remote net.Addr) (*Candidate, error) {
+	var ip net.IP
+	var port int
+
+	switch addr := remote.(type) {
+	case *net.UDPAddr:
+		ip = addr.IP
+		port = addr.Port
+	case *net.TCPAddr:
+		ip = addr.IP
+		port = addr.Port
+	default:
+		return nil, fmt.Errorf("unsupported address type %T", addr)
+	}
+
+	pflxCandidate, err := NewCandidatePeerReflexive(
+		local.NetworkType.String(), // assume, same as that of local
+		ip,
+		port,
+		local.Component,
+		"", // unknown at this moment. TODO: need a review
+		0,  // unknown at this moment. TODO: need a review
+	)
+
+	if err != nil {
+		return nil, flattenErrs([]error{fmt.Errorf("failed to create peer-reflexive candidate: %v", remote), err})
+	}
+
+	// Add pflxCandidate to the remote candidate list
+	return pflxCandidate, nil
+}
+
 // start runs the candidate using the provided connection
 func (c *Candidate) start(a *Agent, conn net.PacketConn) {
 	c.agent = a
@@ -155,13 +188,17 @@ func (c *Candidate) recvLoop() {
 			}
 
 			continue
-		} else {
-			err = c.agent.run(func(agent *Agent) {
-				agent.noSTUNSeen(c, srcAddr)
-			})
-			if err != nil {
-				log.Warnf("Failed to handle message: %v", err)
-			}
+		}
+
+		isValidRemoteCandidate := make(chan bool, 1)
+		err = c.agent.run(func(agent *Agent) {
+			isValidRemoteCandidate <- agent.noSTUNSeen(c, srcAddr)
+		})
+
+		if err != nil {
+			log.Warnf("Failed to handle message: %v", err)
+		} else if !<-isValidRemoteCandidate {
+			log.Warnf("Discarded message from %s, not a valid remote candidate", c.addr())
 		}
 
 		// NOTE This will return packetio.ErrFull if the buffer ever manages to fill up.
@@ -202,16 +239,16 @@ func (c *Candidate) writeTo(raw []byte, dst *Candidate) (int, error) {
 }
 
 // Priority computes the priority for this ICE Candidate
-func (c *Candidate) Priority() uint16 {
+func (c *Candidate) Priority() uint32 {
 	// The local preference MUST be an integer from 0 (lowest preference) to
 	// 65535 (highest preference) inclusive.  When there is only a single IP
 	// address, this value SHOULD be set to 65535.  If there are multiple
 	// candidates for a particular component for a particular data stream
 	// that have the same type, the local preference MUST be unique for each
 	// one.
-	return (2^24)*c.Type.Preference() +
-		(2^8)*c.LocalPreference +
-		(2^0)*(256-c.Component)
+	return (1<<24)*uint32(c.Type.Preference()) +
+		(1<<8)*uint32(c.LocalPreference) +
+		uint32(256-c.Component)
 }
 
 // Equal is used to compare two CandidateBases

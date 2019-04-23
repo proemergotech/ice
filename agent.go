@@ -3,14 +3,13 @@
 package ice
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"net"
 	"sort"
 	"sync"
 	"time"
-
-	"errors"
 
 	"github.com/pion/logging"
 	"github.com/pion/stun"
@@ -19,7 +18,7 @@ import (
 
 const (
 	// taskLoopInterval is the interval at which the agent performs checks
-	taskLoopInterval = 2 * time.Second
+	defaultTaskLoopInterval = 2 * time.Second
 
 	// keepaliveInterval used to keep candidates alive
 	defaultKeepaliveInterval = 10 * time.Second
@@ -29,7 +28,24 @@ const (
 
 	// the number of bytes that can be buffered before we start to error
 	maxBufferSize = 1000 * 1000 // 1MB
+
+	// the number of outbound binding requests we cache
+	maxPendingBindingRequests = 50
+
+	stunAttrHeaderLength = 4
 )
+
+type candidatePairs []*candidatePair
+
+func (cp candidatePairs) Len() int      { return len(cp) }
+func (cp candidatePairs) Swap(i, j int) { cp[i], cp[j] = cp[j], cp[i] }
+
+type byPairPriority struct{ candidatePairs }
+
+// NB: Reverse sort so our candidates start at highest priority
+func (bp byPairPriority) Less(i, j int) bool {
+	return bp.candidatePairs[i].Priority() > bp.candidatePairs[j].Priority()
+}
 
 // Agent represents the ICE agent
 type Agent struct {
@@ -44,8 +60,9 @@ type Agent struct {
 	onConnected     chan struct{}
 	onConnectedOnce sync.Once
 
-	connectivityTicker *time.Ticker
-	connectivityChan   <-chan time.Time
+	connectivityChan <-chan time.Time
+	// force candidate to be contacted immediately (instead of waiting for connectivityChan)
+	forceCandidateContact chan bool
 
 	tieBreaker      uint64
 	connectionState ConnectionState
@@ -67,6 +84,9 @@ type Agent struct {
 	//0 means never
 	keepaliveInterval time.Duration
 
+	// How after should we run our internal taskLoop
+	taskLoopInterval time.Duration
+
 	localUfrag      string
 	localPwd        string
 	localCandidates map[NetworkType][]*Candidate
@@ -79,6 +99,9 @@ type Agent struct {
 	validPairs   []*candidatePair
 
 	buffer *packetio.Buffer
+
+	// LRU of outbound Binding request Transaction IDs
+	pendingBindingRequests [][]byte
 
 	// State for closing
 	done chan struct{}
@@ -132,6 +155,11 @@ type AgentConfig struct {
 	LocalNatRule NatRule
 
 	LoggerFactory logging.LoggerFactory
+
+	// taskLoopInterval controls how often our internal task loop runs, this
+	// task loop handles things like sending keepAlives. This is only value for testing
+	// keepAlive behavior should be modified with KeepaliveInterval and ConnectionTimeout
+	taskLoopInterval time.Duration
 }
 
 // NewAgent creates a new Agent
@@ -140,16 +168,18 @@ func NewAgent(config *AgentConfig) (*Agent, error) {
 		return nil, ErrPort
 	}
 
-	if config.LoggerFactory == nil {
-		config.LoggerFactory = logging.NewDefaultLoggerFactory()
+	loggerFactory := config.LoggerFactory
+	if loggerFactory == nil {
+		loggerFactory = logging.NewDefaultLoggerFactory()
 	}
 
 	a := &Agent{
-		tieBreaker:       rand.New(rand.NewSource(time.Now().UnixNano())).Uint64(),
-		gatheringState:   GatheringStateComplete, // TODO trickle-ice
-		connectionState:  ConnectionStateNew,
-		localCandidates:  make(map[NetworkType][]*Candidate),
-		remoteCandidates: make(map[NetworkType][]*Candidate),
+		tieBreaker:             rand.New(rand.NewSource(time.Now().UnixNano())).Uint64(),
+		gatheringState:         GatheringStateComplete, // TODO trickle-ice
+		connectionState:        ConnectionStateNew,
+		localCandidates:        make(map[NetworkType][]*Candidate),
+		remoteCandidates:       make(map[NetworkType][]*Candidate),
+		pendingBindingRequests: make([][]byte, 0, maxPendingBindingRequests),
 
 		localUfrag:   randSeq(16),
 		localPwd:     randSeq(32),
@@ -160,7 +190,9 @@ func NewAgent(config *AgentConfig) (*Agent, error) {
 		portmin:      config.PortMin,
 		portmax:      config.PortMax,
 		localNatRule: config.LocalNatRule,
-		log:          config.LoggerFactory.NewLogger("ice"),
+		log:          loggerFactory.NewLogger("ice"),
+
+		forceCandidateContact: make(chan bool, 1),
 	}
 
 	// Make sure the buffer doesn't grow indefinitely.
@@ -181,9 +213,15 @@ func NewAgent(config *AgentConfig) (*Agent, error) {
 		a.keepaliveInterval = *config.KeepaliveInterval
 	}
 
+	if config.taskLoopInterval == 0 {
+		a.taskLoopInterval = defaultTaskLoopInterval
+	} else {
+		a.taskLoopInterval = config.taskLoopInterval
+	}
+
 	// Initialize local candidates
-	a.gatherCandidatesLocal(config.NetworkTypes)
-	a.gatherCandidatesReflective(config.Urls, config.NetworkTypes)
+	gatherCandidatesLocal(a, config.NetworkTypes)
+	gatherCandidatesReflective(a, config.Urls, config.NetworkTypes)
 
 	go a.taskLoop()
 	return a, nil
@@ -212,166 +250,6 @@ func (a *Agent) onSelectedCandidatePairChange(p *candidatePair) {
 	}
 }
 
-func (a *Agent) listenUDP(network string, laddr *net.UDPAddr) (*net.UDPConn, error) {
-	if (laddr.Port != 0) || ((a.portmin == 0) && (a.portmax == 0)) {
-		return net.ListenUDP(network, laddr)
-	}
-	var i, j int
-	i = int(a.portmin)
-	if i == 0 {
-		i = 1
-	}
-	j = int(a.portmax)
-	if j == 0 {
-		j = 0xFFFF
-	}
-	for i <= j {
-		c, e := net.ListenUDP(network, &net.UDPAddr{IP: laddr.IP, Port: i})
-		if e == nil {
-			return c, e
-		}
-		i++
-	}
-	return nil, ErrPort
-}
-
-func (a *Agent) gatherCandidatesLocal(networkTypes []NetworkType) {
-	localIPs := localInterfaces(networkTypes)
-	for _, ip := range localIPs {
-		for _, network := range supportedNetworks {
-			conn, err := a.listenUDP(network, &net.UDPAddr{IP: ip, Port: 0})
-			if err != nil {
-				a.log.Warnf("could not listen %s %s\n", network, ip)
-				continue
-			}
-
-			port := conn.LocalAddr().(*net.UDPAddr).Port
-			c, err := NewCandidateHost(network, ip, port, ComponentRTP)
-			if err != nil {
-				a.log.Warnf("Failed to create host candidate: %s %s %d: %v\n", network, ip, port, err)
-				continue
-			}
-
-			networkType := c.NetworkType
-			set := a.localCandidates[networkType]
-			set = append(set, c)
-
-			natC, natConn := a.createLocalNatCandidate(network, ip)
-			if natC != nil {
-				set = append(set, natC)
-			}
-
-			a.localCandidates[networkType] = set
-
-			c.start(a, conn)
-			if natC != nil {
-				natC.start(a, natConn)
-			}
-		}
-	}
-}
-
-func (a *Agent) createLocalNatCandidate(network string, ip net.IP) (*Candidate, net.PacketConn) {
-	if a.localNatRule == nil {
-		return nil, nil
-	}
-
-	conn, err := a.listenUDP(network, &net.UDPAddr{IP: ip, Port: 0})
-	if err != nil {
-		a.log.Warnf("could not listen %s %s\n", network, ip)
-		return nil, nil
-	}
-
-	port := conn.LocalAddr().(*net.UDPAddr).Port
-	natIP, natPort := a.localNatRule(network, ip, port)
-
-	if natIP == nil {
-		return nil, nil
-	}
-
-	c, err := NewCandidateServerReflexive(network, natIP, natPort, ComponentRTP, ip.String(), port)
-	if err != nil {
-		a.log.Warnf("Failed to create host candidate: %s %s %d: %v\n", network, natIP, natPort, err)
-		return nil, nil
-	}
-
-	return c, conn
-}
-
-func (a *Agent) gatherCandidatesReflective(urls []*URL, networkTypes []NetworkType) {
-	for _, networkType := range networkTypes {
-		network := networkType.String()
-		for _, url := range urls {
-			switch url.Scheme {
-			case SchemeTypeSTUN:
-				laddr, xoraddr, err := allocateUDP(network, url)
-				if err != nil {
-					a.log.Warnf("could not allocate %s %s: %v\n", network, url, err)
-					continue
-				}
-				conn, err := net.ListenUDP(network, laddr)
-				if err != nil {
-					a.log.Warnf("could not listen %s %s: %v\n", network, laddr, err)
-				}
-
-				ip := xoraddr.IP
-				port := xoraddr.Port
-				relIP := laddr.IP.String()
-				relPort := laddr.Port
-				c, err := NewCandidateServerReflexive(network, ip, port, ComponentRTP, relIP, relPort)
-				if err != nil {
-					a.log.Warnf("Failed to create server reflexive candidate: %s %s %d: %v\n", network, ip, port, err)
-					continue
-				}
-
-				networkType := c.NetworkType
-				set := a.localCandidates[networkType]
-				set = append(set, c)
-				a.localCandidates[networkType] = set
-
-				c.start(a, conn)
-
-			default:
-				a.log.Warnf("scheme %s is not implemented\n", url.Scheme)
-				continue
-			}
-		}
-	}
-}
-
-func allocateUDP(network string, url *URL) (*net.UDPAddr, *stun.XorAddress, error) {
-	// TODO Do we want the timeout to be configurable?
-	client, err := stun.NewClient(network, fmt.Sprintf("%s:%d", url.Host, url.Port), time.Second*5)
-	if err != nil {
-		return nil, nil, flattenErrs([]error{errors.New("failed to create STUN client"), err})
-	}
-	localAddr, ok := client.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return nil, nil, fmt.Errorf("failed to cast STUN client to UDPAddr")
-	}
-
-	resp, err := client.Request()
-	if err != nil {
-		return nil, nil, flattenErrs([]error{errors.New("failed to make STUN request"), err})
-	}
-
-	if err = client.Close(); err != nil {
-		return nil, nil, flattenErrs([]error{errors.New("failed to close STUN client"), err})
-	}
-
-	attr, ok := resp.GetOneAttribute(stun.AttrXORMappedAddress)
-	if !ok {
-		return nil, nil, fmt.Errorf("got response from STUN server that did not contain XORAddress")
-	}
-
-	var addr stun.XorAddress
-	if err = addr.Unpack(resp, attr); err != nil {
-		return nil, nil, flattenErrs([]error{errors.New("failed to unpack STUN XorAddress response"), err})
-	}
-
-	return localAddr, &addr, nil
-}
-
 func (a *Agent) startConnectivityChecks(isControlling bool, remoteUfrag, remotePwd string) error {
 	switch {
 	case a.haveStarted:
@@ -388,12 +266,12 @@ func (a *Agent) startConnectivityChecks(isControlling bool, remoteUfrag, remoteP
 		agent.remoteUfrag = remoteUfrag
 		agent.remotePwd = remotePwd
 
-		// TODO this should be dynamic, and grow when the connection is stable
-		t := time.NewTicker(taskLoopInterval)
-		agent.connectivityTicker = t
-		agent.connectivityChan = t.C
-
 		agent.updateConnectionState(ConnectionStateChecking)
+
+		// TODO this should be dynamic, and grow when the connection is stable
+		agent.forceCandidateContact <- true
+		t := time.NewTicker(a.taskLoopInterval)
+		agent.connectivityChan = t.C
 	})
 }
 
@@ -406,22 +284,23 @@ func (a *Agent) pingCandidate(local, remote *Candidate) {
 	// agent MUST NOT include the USE-CANDIDATE attribute in a Binding
 	// request.
 
+	transactionID := stun.GenerateTransactionID()
 	if a.isControlling {
-		msg, err = stun.Build(stun.ClassRequest, stun.MethodBinding, stun.GenerateTransactionID(),
+		msg, err = stun.Build(stun.ClassRequest, stun.MethodBinding, transactionID,
 			&stun.Username{Username: a.remoteUfrag + ":" + a.localUfrag},
 			&stun.UseCandidate{},
 			&stun.IceControlling{TieBreaker: a.tieBreaker},
-			&stun.Priority{Priority: uint32(local.Priority())},
+			&stun.Priority{Priority: local.Priority()},
 			&stun.MessageIntegrity{
 				Key: []byte(a.remotePwd),
 			},
 			&stun.Fingerprint{},
 		)
 	} else {
-		msg, err = stun.Build(stun.ClassRequest, stun.MethodBinding, stun.GenerateTransactionID(),
+		msg, err = stun.Build(stun.ClassRequest, stun.MethodBinding, transactionID,
 			&stun.Username{Username: a.remoteUfrag + ":" + a.localUfrag},
 			&stun.IceControlled{TieBreaker: a.tieBreaker},
-			&stun.Priority{Priority: uint32(local.Priority())},
+			&stun.Priority{Priority: local.Priority()},
 			&stun.MessageIntegrity{
 				Key: []byte(a.remotePwd),
 			},
@@ -435,6 +314,12 @@ func (a *Agent) pingCandidate(local, remote *Candidate) {
 	}
 
 	a.log.Tracef("ping STUN from %s to %s\n", local.String(), remote.String())
+	if overflow := len(a.pendingBindingRequests) - maxPendingBindingRequests; overflow > 1 {
+		a.log.Debugf("Discarded %d pending binding requests, pendingBindingRequests is full", overflow)
+		a.pendingBindingRequests = a.pendingBindingRequests[overflow:]
+	}
+
+	a.pendingBindingRequests = append(a.pendingBindingRequests, transactionID)
 	a.sendSTUN(msg, local, remote)
 }
 
@@ -449,18 +334,6 @@ func (a *Agent) updateConnectionState(newState ConnectionState) {
 			go hdlr(newState)
 		}
 	}
-}
-
-type candidatePairs []*candidatePair
-
-func (cp candidatePairs) Len() int      { return len(cp) }
-func (cp candidatePairs) Swap(i, j int) { cp[i], cp[j] = cp[j], cp[i] }
-
-type byPairPriority struct{ candidatePairs }
-
-// NB: Reverse sort so our candidates start at highest priority
-func (bp byPairPriority) Less(i, j int) bool {
-	return bp.candidatePairs[i].Priority() > bp.candidatePairs[j].Priority()
 }
 
 func (a *Agent) setValidPair(local, remote *Candidate, selected, controlling bool) {
@@ -508,17 +381,22 @@ func (a *Agent) run(t task) error {
 }
 
 func (a *Agent) taskLoop() {
+	contactCandidates := func() {
+		if a.validateSelectedPair() {
+			a.log.Trace("checking keepalive")
+			a.checkKeepalive()
+		} else {
+			a.log.Trace("pinging all candidates")
+			a.pingAllCandidates()
+		}
+	}
+
 	for {
 		select {
+		case <-a.forceCandidateContact:
+			contactCandidates()
 		case <-a.connectivityChan:
-			if a.validateSelectedPair() {
-				a.log.Trace("checking keepalive")
-				a.checkKeepalive()
-			} else {
-				a.log.Trace("pinging all candidates")
-				a.pingAllCandidates()
-			}
-
+			contactCandidates()
 		case t := <-a.taskChan:
 			// Run the task
 			t(a)
@@ -720,12 +598,11 @@ func (a *Agent) handleInboundControlled(m *stun.Message, localCandidate, remoteC
 	}
 
 	successResponse := m.Method == stun.MethodBinding && m.Class == stun.ClassSuccessResponse
-	_, usepair := m.GetOneAttribute(stun.AttrUseCandidate)
-	a.log.Tracef("got controlled message (success? %t, usepair? %t)", successResponse, usepair)
-	// Remember the working pair and select it when marked with usepair
-	a.setValidPair(localCandidate, remoteCandidate, usepair, false)
-
-	if !successResponse {
+	a.log.Tracef("got controlled message (success? %t)", successResponse)
+	if successResponse {
+		// Remember the working pair and select it when marked with usepair
+		a.setValidPair(localCandidate, remoteCandidate, true, false)
+	} else {
 		// Send success response
 		a.sendBindingSuccess(m, localCandidate, remoteCandidate)
 	}
@@ -739,75 +616,69 @@ func (a *Agent) handleInboundControlling(m *stun.Message, localCandidate, remote
 		a.log.Debug("useCandidate && a.isControlling == true")
 		return
 	}
-	a.log.Tracef("got controlling message: %#v", m)
 
 	successResponse := m.Method == stun.MethodBinding && m.Class == stun.ClassSuccessResponse
-	// Remember the working pair and select it when receiving a success response
-	a.setValidPair(localCandidate, remoteCandidate, successResponse, true)
-
-	if !successResponse {
+	a.log.Tracef("got controlled message (success? %t)", successResponse)
+	if successResponse {
+		// Remember the working pair and select it when receiving a success response
+		a.setValidPair(localCandidate, remoteCandidate, true, true)
+	} else {
 		// Send success response
 		a.sendBindingSuccess(m, localCandidate, remoteCandidate)
-
-		// We received a ping from the controlled agent. We know the pair works so now we ping with use-candidate set:
-		a.pingCandidate(localCandidate, remoteCandidate)
 	}
 }
 
-// handleNewPeerReflexiveCandidate adds an unseen remote transport address
-// to the remote candidate list as a peer-reflexive candidate.
-func (a *Agent) handleNewPeerReflexiveCandidate(local *Candidate, remote net.Addr) error {
-	var ip net.IP
-	var port int
-
-	switch addr := remote.(type) {
-	case *net.UDPAddr:
-		ip = addr.IP
-		port = addr.Port
-	case *net.TCPAddr:
-		ip = addr.IP
-		port = addr.Port
-	default:
-		return fmt.Errorf("unsupported address type %T", addr)
+// Assert that the passed TransactionID is in our pendingBindingRequests and remove if it is
+func (a *Agent) handleInboundBindingSuccess(id []byte) bool {
+	for i := range a.pendingBindingRequests {
+		if bytes.Equal(a.pendingBindingRequests[i], id) {
+			a.pendingBindingRequests = append(a.pendingBindingRequests[:i], a.pendingBindingRequests[:i+1]...)
+			return true
+		}
 	}
-
-	pflxCandidate, err := NewCandidatePeerReflexive(
-		local.NetworkType.String(), // assume, same as that of local
-		ip,
-		port,
-		local.Component,
-		"", // unknown at this moment. TODO: need a review
-		0,  // unknown at this moment. TODO: need a review
-	)
-
-	if err != nil {
-		return flattenErrs([]error{fmt.Errorf("failed to create peer-reflexive candidate: %v", remote), err})
-	}
-
-	// Add pflxCandidate to the remote candidate list
-	a.addRemoteCandidate(pflxCandidate)
-	return nil
+	return false
 }
 
 // handleInbound processes STUN traffic from a remote candidate
 func (a *Agent) handleInbound(m *stun.Message, local *Candidate, remote net.Addr) {
+	if m == nil || local == nil {
+		return
+	}
 	a.log.Tracef("inbound STUN from %s to %s", remote.String(), local.String())
+
+	switch {
+	case m.Method == stun.MethodBinding && m.Class == stun.ClassSuccessResponse:
+		if err := assertInboundMessageIntegrity(m, []byte(a.remotePwd)); err != nil {
+			a.log.Warnf("discard message from (%s), %v", remote, err)
+			return
+		} else if !a.handleInboundBindingSuccess(m.TransactionID) {
+			a.log.Warnf("discard message from (%s), invalid TransactionID %s", remote, m.TransactionID)
+			return
+		}
+	case m.Method == stun.MethodBinding && m.Class == stun.ClassRequest:
+		if err := assertInboundUsername(m, a.localUfrag+":"+a.remoteUfrag); err != nil {
+			a.log.Warnf("discard message from (%s), %v", remote, err)
+			return
+		} else if err := assertInboundMessageIntegrity(m, []byte(a.localPwd)); err != nil {
+			a.log.Warnf("discard message from (%s), %v", remote, err)
+			return
+		}
+	default:
+		return
+	}
+
 	remoteCandidate := a.findRemoteCandidate(local.NetworkType, remote)
 	if remoteCandidate == nil {
 		a.log.Debugf("detected a new peer-reflexive candiate: %s ", remote)
-		err := a.handleNewPeerReflexiveCandidate(local, remote)
+		pflxCandidate, err := handleNewPeerReflexiveCandidate(local, remote)
 		if err != nil {
-			// Log warning, then move on..
 			a.log.Warn(err.Error())
 		}
+
+		a.addRemoteCandidate(pflxCandidate)
 		return
 	}
-
 	remoteCandidate.seen(false)
-
-	if m.Class == stun.ClassIndication {
-		return
-	}
 
 	if a.isControlling {
 		a.handleInboundControlling(m, local, remoteCandidate)
@@ -816,12 +687,16 @@ func (a *Agent) handleInbound(m *stun.Message, local *Candidate, remote net.Addr
 	}
 }
 
-// noSTUNSeen processes non STUN traffic from a remote candidate
-func (a *Agent) noSTUNSeen(local *Candidate, remote net.Addr) {
+// noSTUNSeen processes non STUN traffic from a remote candidate,
+// and returns true if it is an actual remote candidate
+func (a *Agent) noSTUNSeen(local *Candidate, remote net.Addr) bool {
 	remoteCandidate := a.findRemoteCandidate(local.NetworkType, remote)
-	if remoteCandidate != nil {
-		remoteCandidate.seen(false)
+	if remoteCandidate == nil {
+		return false
 	}
+
+	remoteCandidate.seen(false)
+	return true
 }
 
 func (a *Agent) getBestPair() (*candidatePair, error) {
