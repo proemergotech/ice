@@ -104,11 +104,47 @@ func gatherCandidatesLocal(a *Agent, networkTypes []NetworkType) {
 			networkType := c.NetworkType
 			set := a.localCandidates[networkType]
 			set = append(set, c)
+
+			natC, natConn := a.createLocalNatCandidate(network, ip)
+			if natC != nil {
+				set = append(set, natC)
+			}
+
 			a.localCandidates[networkType] = set
 
 			c.start(a, conn)
+			if natC != nil {
+				natC.start(a, natConn)
+			}
 		}
 	}
+}
+
+func (a *Agent) createLocalNatCandidate(network string, ip net.IP) (*Candidate, net.PacketConn) {
+	if a.localNatRule == nil {
+		return nil, nil
+	}
+
+	conn, err := listenUDP(int(a.portmax), int(a.portmin), network, &net.UDPAddr{IP: ip, Port: 0})
+	if err != nil {
+		a.log.Warnf("could not listen %s %s\n", network, ip)
+		return nil, nil
+	}
+
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	natIP, natPort := a.localNatRule(network, ip, port)
+
+	if natIP == nil {
+		return nil, nil
+	}
+
+	c, err := NewCandidateServerReflexive(network, natIP, natPort, ComponentRTP, ip.String(), port)
+	if err != nil {
+		a.log.Warnf("Failed to create host candidate: %s %s %d: %v\n", network, natIP, natPort, err)
+		return nil, nil
+	}
+
+	return c, conn
 }
 
 func gatherCandidatesReflective(a *Agent, urls []*URL, networkTypes []NetworkType) {
